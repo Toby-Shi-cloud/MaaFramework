@@ -2,9 +2,16 @@
 
 #import <AppKit/AppKit.h>
 
+#include <libproc.h>
+
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <thread>
+#include <vector>
 
 #include "MaaUtils/Logger.h"
 
@@ -12,6 +19,36 @@ MAA_CTRL_UNIT_NS_BEGIN
 
 namespace
 {
+struct ProcessIdentity
+{
+    pid_t pid;
+    uint64_t start_sec;
+    uint64_t start_usec;
+};
+
+std::optional<ProcessIdentity> query_process_identity(pid_t pid, int& error)
+{
+    proc_bsdinfo info { };
+    errno = 0;
+    const int ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+    if (ret != sizeof(info)) {
+        error = errno;
+        if (error == 0) {
+            error = ret == 0 ? ESRCH : EIO;
+        }
+        return std::nullopt;
+    }
+    error = 0;
+    return ProcessIdentity { pid, info.pbi_start_tvsec, info.pbi_start_tvusec };
+}
+
+bool is_process_alive(const ProcessIdentity& identity)
+{
+    int error = 0;
+    const auto current = query_process_identity(identity.pid, error);
+    return current && current->start_sec == identity.start_sec && current->start_usec == identity.start_usec;
+}
+
 NSURL* find_application(NSString* target, const std::string& search_path)
 {
     if ([target hasPrefix:@"/"]) {
@@ -110,27 +147,44 @@ bool stop_app(const std::string& intent)
         }
 
         bool stopped = true;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::vector<ProcessIdentity> pending;
         for (NSRunningApplication* app in apps) {
             const pid_t pid = app.processIdentifier;
+            int error = 0;
+            const auto identity = query_process_identity(pid, error);
+            if (!identity) {
+                if (error == ESRCH) {
+                    LogInfo << "Application already exited" << VAR(pid);
+                    continue;
+                }
+                LogError << "Failed to query application process" << VAR(pid) << VAR(error);
+                stopped = false;
+                continue;
+            }
             if (![app terminate]) {
                 LogError << "Failed to send quit request" << VAR(pid);
                 stopped = false;
                 continue;
             }
 
-            if ([NSThread isMainThread]) {
-                LogWarn << "Quit request sent; skipping exit detection on the main thread. Success only indicates the quit request was sent."
-                        << VAR(pid);
-                continue;
-            }
+            pending.push_back(*identity);
+        }
 
-            for (int attempt = 0; attempt < 40 && !app.isTerminated; ++attempt) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        while (!pending.empty()) {
+            std::erase_if(pending, [](const ProcessIdentity& identity) { return !is_process_alive(identity); });
+            if (pending.empty()) {
+                break;
             }
-            if (!app.isTerminated) {
-                LogError << "Application did not quit after the quit request" << VAR(pid);
+            if (std::chrono::steady_clock::now() >= deadline) {
+                for (const auto& identity : pending) {
+                    const pid_t pid = identity.pid;
+                    LogError << "Application did not quit after the quit request" << VAR(pid);
+                }
                 stopped = false;
+                break;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         return stopped;
     }
