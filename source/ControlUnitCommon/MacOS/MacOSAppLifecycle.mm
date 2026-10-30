@@ -3,16 +3,9 @@
 #import <AppKit/AppKit.h>
 
 #include <libproc.h>
-#include <sys/proc.h>
-
-#ifndef SZOMB
-#define SZOMB 5
-#endif
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
-#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
@@ -24,76 +17,10 @@ MAA_CTRL_UNIT_NS_BEGIN
 
 namespace
 {
-struct ProcessIdentity
-{
-    pid_t pid = 0;
-    uint64_t start_sec = 0;
-    uint64_t start_usec = 0;
-    uint32_t status = 0;
-    uint32_t flags = 0;
-    uint32_t ppid = 0;
-    std::string comm;
-};
-
-struct ProcessQueryResult
-{
-    ProcessIdentity identity;
-    int ret = 0;
-    int error = 0;
-};
-
-struct PendingProcess
-{
-    ProcessIdentity expected;
-    ProcessQueryResult observed;
-};
-
-ProcessQueryResult query_process_identity(pid_t pid)
+bool process_exists(pid_t pid)
 {
     proc_bsdinfo info { };
-    errno = 0;
-    const int ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
-    const int error = errno;
-    return {
-        { pid,
-          info.pbi_start_tvsec,
-          info.pbi_start_tvusec,
-          info.pbi_status,
-          info.pbi_flags,
-          info.pbi_ppid,
-          std::string(info.pbi_comm, std::find(info.pbi_comm, info.pbi_comm + sizeof(info.pbi_comm), '\0')) },
-        ret,
-        error
-    };
-}
-
-const char* process_exit_reason(const ProcessIdentity& expected, const ProcessQueryResult& observed)
-{
-    if (observed.ret <= 0) {
-        return "proc_pidinfo failed";
-    }
-    if (observed.ret != sizeof(proc_bsdinfo)) {
-        return "proc_pidinfo returned an unexpected size";
-    }
-    if (observed.identity.status == SZOMB) {
-        return "process is a zombie";
-    }
-    if (observed.identity.start_sec != expected.start_sec || observed.identity.start_usec != expected.start_usec) {
-        return "process start time changed";
-    }
-    return nullptr;
-}
-
-bool is_process_alive(PendingProcess& process)
-{
-    process.observed = query_process_identity(process.expected.pid);
-    const char* reason = process_exit_reason(process.expected, process.observed);
-    if (reason) {
-        LogInfo << "Application process exited" << VAR(process.expected.pid) << VAR(reason) << VAR(process.observed.ret)
-                << VAR(process.observed.error);
-        return false;
-    }
-    return true;
+    return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == static_cast<int>(sizeof(info));
 }
 
 NSURL* find_application(NSString* target, const std::string& search_path)
@@ -195,45 +122,26 @@ bool stop_app(const std::string& intent)
 
         bool stopped = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        std::vector<PendingProcess> pending;
+        std::vector<pid_t> pending;
         for (NSRunningApplication* app in apps) {
             const pid_t pid = app.processIdentifier;
-            const auto snapshot = query_process_identity(pid);
-            const auto& identity = snapshot.identity;
-            LogDebug << "Application process snapshot" << VAR(pid) << VAR(identity.ppid) << VAR(identity.comm) << VAR(identity.status)
-                     << VAR(identity.start_sec) << VAR(identity.start_usec) << VAR(snapshot.ret) << VAR(snapshot.error);
-            if (snapshot.ret <= 0 && snapshot.error != ESRCH && snapshot.error != 0) {
-                LogError << "Failed to query application process" << VAR(pid) << VAR(snapshot.ret) << VAR(snapshot.error);
-                stopped = false;
-                continue;
-            }
-            if (const char* reason = process_exit_reason(identity, snapshot)) {
-                LogInfo << "Application already exited" << VAR(pid) << VAR(reason) << VAR(snapshot.ret) << VAR(snapshot.error);
-                continue;
-            }
             if (![app terminate]) {
                 LogError << "Failed to send quit request" << VAR(pid);
                 stopped = false;
                 continue;
             }
 
-            pending.push_back({ identity, snapshot });
+            pending.push_back(pid);
         }
 
         while (!pending.empty()) {
-            std::erase_if(pending, [](PendingProcess& process) { return !is_process_alive(process); });
+            std::erase_if(pending, [](pid_t pid) { return !process_exists(pid); });
             if (pending.empty()) {
                 break;
             }
             if (std::chrono::steady_clock::now() >= deadline) {
-                for (const auto& process : pending) {
-                    const auto& expected = process.expected;
-                    const auto& observed = process.observed.identity;
-                    const pid_t pid = expected.pid;
-                    LogError << "Application did not quit after the quit request" << VAR(pid) << VAR(process.observed.ret)
-                             << VAR(process.observed.error) << VAR(observed.status) << VAR(observed.flags) << VAR(observed.ppid)
-                             << VAR(observed.comm) << VAR(expected.start_sec) << VAR(expected.start_usec) << VAR(observed.start_sec)
-                             << VAR(observed.start_usec);
+                for (const pid_t pid : pending) {
+                    LogError << "Application did not quit after the quit request" << VAR(pid);
                 }
                 stopped = false;
                 break;
