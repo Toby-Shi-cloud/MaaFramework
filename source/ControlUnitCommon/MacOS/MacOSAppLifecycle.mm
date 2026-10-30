@@ -3,13 +3,18 @@
 #import <AppKit/AppKit.h>
 
 #include <libproc.h>
+#include <sys/proc.h>
+
+#ifndef SZOMB
+#define SZOMB 5
+#endif
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -21,32 +26,74 @@ namespace
 {
 struct ProcessIdentity
 {
-    pid_t pid;
-    uint64_t start_sec;
-    uint64_t start_usec;
+    pid_t pid = 0;
+    uint64_t start_sec = 0;
+    uint64_t start_usec = 0;
+    uint32_t status = 0;
+    uint32_t flags = 0;
+    uint32_t ppid = 0;
+    std::string comm;
 };
 
-std::optional<ProcessIdentity> query_process_identity(pid_t pid, int& error)
+struct ProcessQueryResult
+{
+    ProcessIdentity identity;
+    int ret = 0;
+    int error = 0;
+};
+
+struct PendingProcess
+{
+    ProcessIdentity expected;
+    ProcessQueryResult observed;
+};
+
+ProcessQueryResult query_process_identity(pid_t pid)
 {
     proc_bsdinfo info { };
     errno = 0;
     const int ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
-    if (ret != sizeof(info)) {
-        error = errno;
-        if (error == 0) {
-            error = ret == 0 ? ESRCH : EIO;
-        }
-        return std::nullopt;
-    }
-    error = 0;
-    return ProcessIdentity { pid, info.pbi_start_tvsec, info.pbi_start_tvusec };
+    const int error = errno;
+    return {
+        { pid,
+          info.pbi_start_tvsec,
+          info.pbi_start_tvusec,
+          info.pbi_status,
+          info.pbi_flags,
+          info.pbi_ppid,
+          std::string(info.pbi_comm, std::find(info.pbi_comm, info.pbi_comm + sizeof(info.pbi_comm), '\0')) },
+        ret,
+        error
+    };
 }
 
-bool is_process_alive(const ProcessIdentity& identity)
+const char* process_exit_reason(const ProcessIdentity& expected, const ProcessQueryResult& observed)
 {
-    int error = 0;
-    const auto current = query_process_identity(identity.pid, error);
-    return current && current->start_sec == identity.start_sec && current->start_usec == identity.start_usec;
+    if (observed.ret <= 0) {
+        return "proc_pidinfo failed";
+    }
+    if (observed.ret != sizeof(proc_bsdinfo)) {
+        return "proc_pidinfo returned an unexpected size";
+    }
+    if (observed.identity.status == SZOMB) {
+        return "process is a zombie";
+    }
+    if (observed.identity.start_sec != expected.start_sec || observed.identity.start_usec != expected.start_usec) {
+        return "process start time changed";
+    }
+    return nullptr;
+}
+
+bool is_process_alive(PendingProcess& process)
+{
+    process.observed = query_process_identity(process.expected.pid);
+    const char* reason = process_exit_reason(process.expected, process.observed);
+    if (reason) {
+        LogInfo << "Application process exited" << VAR(process.expected.pid) << VAR(reason) << VAR(process.observed.ret)
+                << VAR(process.observed.error);
+        return false;
+    }
+    return true;
 }
 
 NSURL* find_application(NSString* target, const std::string& search_path)
@@ -148,18 +195,20 @@ bool stop_app(const std::string& intent)
 
         bool stopped = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        std::vector<ProcessIdentity> pending;
+        std::vector<PendingProcess> pending;
         for (NSRunningApplication* app in apps) {
             const pid_t pid = app.processIdentifier;
-            int error = 0;
-            const auto identity = query_process_identity(pid, error);
-            if (!identity) {
-                if (error == ESRCH) {
-                    LogInfo << "Application already exited" << VAR(pid);
-                    continue;
-                }
-                LogError << "Failed to query application process" << VAR(pid) << VAR(error);
+            const auto snapshot = query_process_identity(pid);
+            const auto& identity = snapshot.identity;
+            LogDebug << "Application process snapshot" << VAR(pid) << VAR(identity.ppid) << VAR(identity.comm) << VAR(identity.status)
+                     << VAR(identity.start_sec) << VAR(identity.start_usec) << VAR(snapshot.ret) << VAR(snapshot.error);
+            if (snapshot.ret <= 0 && snapshot.error != ESRCH && snapshot.error != 0) {
+                LogError << "Failed to query application process" << VAR(pid) << VAR(snapshot.ret) << VAR(snapshot.error);
                 stopped = false;
+                continue;
+            }
+            if (const char* reason = process_exit_reason(identity, snapshot)) {
+                LogInfo << "Application already exited" << VAR(pid) << VAR(reason) << VAR(snapshot.ret) << VAR(snapshot.error);
                 continue;
             }
             if (![app terminate]) {
@@ -168,18 +217,23 @@ bool stop_app(const std::string& intent)
                 continue;
             }
 
-            pending.push_back(*identity);
+            pending.push_back({ identity, snapshot });
         }
 
         while (!pending.empty()) {
-            std::erase_if(pending, [](const ProcessIdentity& identity) { return !is_process_alive(identity); });
+            std::erase_if(pending, [](PendingProcess& process) { return !is_process_alive(process); });
             if (pending.empty()) {
                 break;
             }
             if (std::chrono::steady_clock::now() >= deadline) {
-                for (const auto& identity : pending) {
-                    const pid_t pid = identity.pid;
-                    LogError << "Application did not quit after the quit request" << VAR(pid);
+                for (const auto& process : pending) {
+                    const auto& expected = process.expected;
+                    const auto& observed = process.observed.identity;
+                    const pid_t pid = expected.pid;
+                    LogError << "Application did not quit after the quit request" << VAR(pid) << VAR(process.observed.ret)
+                             << VAR(process.observed.error) << VAR(observed.status) << VAR(observed.flags) << VAR(observed.ppid)
+                             << VAR(observed.comm) << VAR(expected.start_sec) << VAR(expected.start_usec) << VAR(observed.start_sec)
+                             << VAR(observed.start_usec);
                 }
                 stopped = false;
                 break;
